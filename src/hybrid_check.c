@@ -1,5 +1,6 @@
 //
-// Demo program part of the UAntwerp VSC tutorials.
+// Demo program part of the UAntwerp VSC tutorials and LUMI consortium LUMI
+// tutorials (and production tools).
 //
 // This program is used to demonstrate starting a hybrid OpenMP/MPI-program.
 // It is essentially a hello world program, but with an added element that does
@@ -62,6 +63,9 @@ typedef struct {
     int          mpi_myrank;                 // MPI rank of the current process
     int          openmp_numthreads;          // Number of threads in the current MPI process
     int          ncpus;                      // Number of CPUs on the node as detected by Linux.
+    int          slurm_procid;               // Slurm global rank from SLURM_PROCID, or -1
+    int          slurm_nodeid;               // Slurm relative node ID from SLURM_NODEID, or -1
+    int          slurm_localid;              // Slurm local rank from SLURM_LOCALID, or -1
     char         hostname[HOSTNAMELENGTH+1]; // Name of the host on which this process is running
     char         label[LABELLENGTH+1];       // Label (if specified)
     t_threadData firstthread;                // To make sure that the end of the struct is properly aligned for integers.
@@ -124,29 +128,51 @@ void print_help( const char *exe_name ) {
 	fprintf( stderr,
 		"\n"
 		"Flags accepted:\n"
-		" -h         produce help information and exit\n"
-		" -l <label> specify a label to use in the output for this process\n"
-		"            This can be used to simulate using different executable names\n"
-		"            in some scenarios.\n"
-		" -w <time>  keeps all allocated CPUs busy for approximately <time> seconds\n"
-		"            computing the surface of the Mandelbrot fractal with a naive\n"
-		"            Monte Carlo algorithm so that a user can logon to the nodes\n"
-		"            and see what is happening. At the end it will print the\n"
-		"            allocation of the threads again as the OS may have improved\n"
-		"            the spreading of the threads over the cores.\n"
-	    "            If different values are given for different parts in a\n"
-		"            heterogeneous job, the largest will be used and applied to all\n"
-        "            components of the heterogeneous job.\n"
-		" -n         Show the NUMA affinity mask: Once ASCII character per virtual core,\n"
-		"            where a number or capital letter denotes that the core can be used\n"
-		"            and the number or letter denotes the NUMA group (or a * if the\n"
-		"            number of the NUMA group would be 36 or larger) and a dot denotes\n"
-		"            that the core is not used.\n"
-		" -r         Numeric representation of the affinity mask as a series of ranges\n"
-		"            of cores.\n"
+		" -h             produce help information and exit\n"
+		" -l <label>     specify a label to use in the output for this process\n"
+		"                This can be used to simulate using different executable names\n"
+		"                in some scenarios.\n"
+		" -w <time>      keeps all allocated CPUs busy for approximately <time> seconds\n"
+		"                computing the surface of the Mandelbrot fractal with a naive\n"
+		"                Monte Carlo algorithm so that a user can logon to the nodes\n"
+		"                and see what is happening. At the end it will print the\n"
+		"                allocation of the threads again as the OS may have improved\n"
+		"                the spreading of the threads over the cores.\n"
+	    "                If different values are given for different parts in a\n"
+		"                heterogeneous job, the largest will be used and applied to all\n"
+        "                components of the heterogeneous job.\n"
+		" -n             Show the NUMA affinity mask: Once ASCII character per virtual\n"
+		"                core, where a number or capital letter denotes that the core\n"
+		"                can be used and the number or letter denotes the NUMA group\n"
+		"                (or a * if the number of the NUMA group would be 36 or larger)\n"
+		"                and a dot denotes that the core is not used.\n"
+		" -r             Numeric representation of the affinity mask as a series of\n"
+		"                ranges of cores.\n"
+		" --no-hostname  Do not show the hostname in the output.\n"
+		" --no-cpu       Do not show the CPU number in the output.\n"
+#if defined( WITH_MPI )
+		" --slurmvars    Slow the value of SLURM_NODEID, SLURM_LOCALID and SLURM_PROCID\n"
+		"                for each rank. This can be useful to study Cray MPICH rank\n"
+		"                reordering.\n"
+#endif
+#if defined( WITH_MPI )
+		" --fp           Format showing host, cpu and numeric mask, but no Slurm\n"
+		"                variables.\n"
+#else
+    	" --fp           Format showing host, cpu and numeric mask.\n"
+#endif
+#if defined( WITH_MPI )
+		" --fr           Format showing slurm variables and numeric mask, but no hostname\n"
+		"                or cpu number, making the output fully reproducible when running\n"
+		"                on exclusive nodes.\n"
+#else
+		" --fr           Format showing numeric mask, but no hostname or cpu number,\n"
+		"                making the output fully reproducible when running on exclusive\n"
+		"                nodes.\n"
+#endif
 		"\n"
 	);
-#ifdef WITH_MPI
+#if defined( WITH_MPI )
 	fprintf( stderr,
 		"In a heterogeneous job, the -w, -n and -r options need to be specified for\n"
         "only one of the components of the job but will apply to all components.\n"
@@ -185,6 +211,28 @@ int get_numcpus() {
   return ncpu;
 
 }
+
+
+
+//******************************************************************************
+//
+// get_slurmvar( const char *env_var )
+//
+// Get the numeric value of the Slurm environment variable, or -1 if the
+// variable is not set.
+//
+int get_slurmvar( const char *env_var  ) {
+
+    char *env_value = getenv( env_var );
+
+    if ( env_value == (char *) NULL )
+    	return -1;
+    else {
+        return atoi( env_value );
+    }
+
+}
+
 
 
 //******************************************************************************
@@ -412,7 +460,9 @@ void numamask_to_range( char * const rangemask, const short * const numamask, co
 
 void get_args( int argc, char **argv, int mpi_myrank,
 		       char *option_label, long *wait_time,
-			   unsigned int *show_numamask, unsigned int *show_rangemask ) {
+			   unsigned int *show_numamask, unsigned int *show_rangemask,
+			   unsigned int *show_hostname, unsigned int *show_cpu,
+			   unsigned int *show_slurmvars ) {
 
 	char *exe_name;
 
@@ -424,6 +474,9 @@ void get_args( int argc, char **argv, int mpi_myrank,
 	*wait_time = 0L;
 	*show_numamask = 0;
 	*show_rangemask = 0;
+	*show_hostname = 1;
+	*show_cpu = 1;
+	*show_slurmvars = 0;
 
 	// Remove the program name
 	exe_name = basename( *argv++ );
@@ -459,6 +512,30 @@ void get_args( int argc, char **argv, int mpi_myrank,
 				fprintf( stderr, "%s: No valid waiting time found for -w.\n", exe_name );
 				exit( EXIT_WRONG_ARGUMENT );
 			}
+		} else if ( strcmp( *argv, "--no-hostname" ) == 0 ) {
+			*show_hostname = 0;
+		} else if ( strcmp( *argv, "--no-cpu" ) == 0 ) {
+			*show_cpu = 0;
+#if defined( WITH_MPI )
+		} else if ( strcmp( *argv, "--show-slurmvars" ) == 0 ) {
+			*show_slurmvars = 1;
+#endif
+		} else if ( strcmp( *argv, "--fp" ) == 0 ) {
+			*show_slurmvars = 0;
+			*show_hostname  = 1;
+			*show_cpu       = 1;
+			*show_numamask  = 0;
+			*show_rangemask = 1;
+		} else if ( strcmp( *argv, "--fr" ) == 0 ) {
+#if defined( WITH_MPI )
+			*show_slurmvars = 1;
+#else
+			*show_slurmvars = 0;
+#endif
+			*show_hostname  = 0;
+			*show_cpu       = 0;
+			*show_numamask  = 0;
+			*show_rangemask = 1;
 		} else {
 			fprintf( stderr, "%s: Illegal flag found: %s\n", exe_name, *argv);
 			exit( EXIT_WRONG_ARGUMENT );
@@ -487,7 +564,9 @@ void get_args( int argc, char **argv, int mpi_myrank,
 
 
 int data_gather_print( const t_configInfo *configInfo, const char *option_label,
-		               unsigned int show_numamask, unsigned int show_rangemask ) {
+		               unsigned int show_numamask, unsigned int show_rangemask,
+					   unsigned int show_hostname, unsigned int show_cpu,
+					   unsigned int show_slurmvars ) {
 
 	const int mssgID = 1;
 
@@ -540,6 +619,9 @@ int data_gather_print( const t_configInfo *configInfo, const char *option_label,
     my_rankData->mpi_myrank = configInfo->mpi_myrank;
     my_rankData->openmp_numthreads = configInfo->openmp_numthreads;
     my_rankData->ncpus = get_numcpus();
+    my_rankData->slurm_procid = get_slurmvar( "SLURM_PROCID" );
+    my_rankData->slurm_nodeid = get_slurmvar( "SLURM_NODEID" );
+    my_rankData->slurm_localid = get_slurmvar( "SLURM_LOCALID" );
     gethostname( my_rankData->hostname, (size_t) (HOSTNAMELENGTH+1) );
     strcpy( my_rankData->label, option_label );
     nnumanodes = get_cpu_to_numanode( cpu_to_numanode, my_rankData->ncpus );
@@ -609,40 +691,33 @@ int data_gather_print( const t_configInfo *configInfo, const char *option_label,
             // The min function should not be needed, but it prevents overrunning memory in case of a corrupt
             // message so also helps to avoid segmentation violations.
             for ( int c2 = 0; c2 < min( buf_rankData->openmp_numthreads, configInfo->max_openmp_numthreads ); c2++ ) {
-#if defined( WITH_OMP ) && defined( WITH_MPI)
-            	// Hybrid case
-            	printf( "++ %-*s%sMPI rank %3d/%-3d OpenMP thread %3d/%-3d on cpu %3ld/%-3d of %s",
-            			max_label_length, buf_rankData->label, label_sep,
-						buf_rankData->mpi_myrank, configInfo->mpi_numranks,
-						c2, buf_rankData->openmp_numthreads,
-						buf_rankData->threadData[c2].corenum, buf_rankData->ncpus, buf_rankData->hostname );
-#elif defined( WITH_OMP)
-            	// OpenMP case
-            	printf( "++ %-*s%sOpenMP thread %3d/%-3d on cpu %3ld/%-3d of %s",
-            			max_label_length, buf_rankData->label, label_sep,
-						c2, buf_rankData->openmp_numthreads,
-						buf_rankData->threadData[c2].corenum, buf_rankData->ncpus, buf_rankData->hostname );
-#elif defined( WITH_MPI)
-            	// MPI case
-            	printf( "++ %-*s%sMPI rank %3d/%-3d on cpu %3ld/%-3d of %s",
-            			max_label_length, buf_rankData->label, label_sep,
-						buf_rankData->mpi_myrank, configInfo->mpi_numranks,
-						buf_rankData->threadData[c2].corenum, buf_rankData->ncpus, buf_rankData->hostname );
-#else
-            	// Serial case
-            	printf( "++ %-*s%srunning on cpu %3ld/%-3d of %s",
-            			max_label_length, buf_rankData->label, label_sep,
-						buf_rankData->threadData[c2].corenum, buf_rankData->ncpus, buf_rankData->hostname );
+            	printf( "++ %-*s%s", max_label_length, buf_rankData->label, label_sep );
+#if defined( WITH_MPI )
+            	printf( "MPI rank %3d/%-3d ",
+            			buf_rankData->mpi_myrank, configInfo->mpi_numranks );
+
 #endif
+            	if ( show_slurmvars )
+            		printf( "NodeID/LocID/GlobID %2d/%3d/%3d ",
+            				buf_rankData->slurm_nodeid, buf_rankData->slurm_localid, buf_rankData->slurm_procid );
+            	if ( show_hostname )
+            		printf( "host %s ", buf_rankData->hostname );
+#if defined( WITH_OMP )
+            	// OpenMP case or hybrid case
+            	printf( "OpenMP thread %3d/%-3d ",
+            			c2, buf_rankData->openmp_numthreads );
+#endif
+            	if ( show_cpu )
+            	    printf( "cpu %3ld/%-3d ", buf_rankData->threadData[c2].corenum, buf_rankData->ncpus );
             	if ( show_numamask || show_rangemask ) {
-            		printf( " mask " );
+            		printf( "mask " );
             		if ( show_numamask ) {
             			numamask_to_ASCII( numamask, buf_rankData->threadData[c2].numamask, buf_rankData->ncpus );
             			printf( "%s ", numamask );
             		}
                     if ( show_rangemask ) {
                     	numamask_to_range( rangemask, buf_rankData->threadData[c2].numamask, buf_rankData->ncpus );
-            			printf( "%s", rangemask );
+            			printf( "(%s)", rangemask );
                     }
             	}
             	printf(  "\n" );
@@ -782,6 +857,9 @@ int main( int argc, char *argv[] )
 	long wait_time, max_wait_time;
 	unsigned int show_numamask, in_show_numamask;
 	unsigned int show_rangemask, in_show_rangemask;
+	unsigned int show_hostname, in_show_hostname;
+	unsigned int show_cpu, in_show_cpu;
+	unsigned int show_slurmvars, in_show_slurmvars;
 
 	t_configInfo configInfo;
 
@@ -832,7 +910,8 @@ int main( int argc, char *argv[] )
     //
     // Read the command line arguments
     //
-    get_args( argc, argv, configInfo.mpi_myrank, option_label, &wait_time, &in_show_numamask, &in_show_rangemask );
+    get_args( argc, argv, configInfo.mpi_myrank, option_label, &wait_time, &in_show_numamask, &in_show_rangemask,
+    		  &in_show_hostname, &in_show_cpu, &in_show_slurmvars );
 
     // Compute the maximum wait time: In a heterogeneous situation, one may have given a different load
     // for each process set yet all tasks must be able to decide if we should put load or not. In fact.
@@ -841,10 +920,16 @@ int main( int argc, char *argv[] )
     MPI_Allreduce( &wait_time,         &max_wait_time,  1, MPI_LONG,     MPI_MAX, MPI_COMM_WORLD );
     MPI_Allreduce( &in_show_numamask,  &show_numamask,  1, MPI_UNSIGNED, MPI_MAX, MPI_COMM_WORLD );
     MPI_Allreduce( &in_show_rangemask, &show_rangemask, 1, MPI_UNSIGNED, MPI_MAX, MPI_COMM_WORLD );
+    MPI_Allreduce( &in_show_hostname,  &show_hostname,  1, MPI_UNSIGNED, MPI_MAX, MPI_COMM_WORLD );
+    MPI_Allreduce( &in_show_cpu,       &show_cpu,       1, MPI_UNSIGNED, MPI_MAX, MPI_COMM_WORLD );
+    MPI_Allreduce( &in_show_slurmvars, &show_slurmvars, 1, MPI_UNSIGNED, MPI_MAX, MPI_COMM_WORLD );
 #else
     max_wait_time  = wait_time;
     show_numamask  = in_show_numamask;
     show_rangemask = in_show_rangemask;
+    show_hostname  = in_show_hostname;
+    show_cpu       = in_show_cpu;
+    show_slurmvars = in_show_slurmvars;
 #endif
 
     // Print some information on the data just computed.
@@ -873,7 +958,7 @@ int main( int argc, char *argv[] )
     }
 
     // Print detailed info on the current core for processes and threads.
-    data_gather_print( &configInfo, option_label, show_numamask, show_rangemask );
+    data_gather_print( &configInfo, option_label, show_numamask, show_rangemask, show_hostname, show_cpu, show_slurmvars );
 
     // If simulating some load was requested, simulate some load and print the configuration again.
 
@@ -885,7 +970,7 @@ int main( int argc, char *argv[] )
     	if ( ( error == 0 ) && ( configInfo.mpi_myrank == 0 ) )
     		printf( "Approximation for the surface of the Mandelbrot fractal: %16.14lg\n\n", mandel_surface );
 
-    	data_gather_print( &configInfo, option_label, show_numamask, show_rangemask );
+    	data_gather_print( &configInfo, option_label, show_numamask, show_rangemask, show_hostname, show_cpu, show_slurmvars );
 
     }
 
